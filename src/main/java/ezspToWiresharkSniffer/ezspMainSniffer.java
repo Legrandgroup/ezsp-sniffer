@@ -1,12 +1,12 @@
 package ezspToWiresharkSniffer;
 
 import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.SocketException;
+import java.rmi.UnknownHostException;
 import org.slf4j.LoggerFactory;
 
 import com.zsmartsystems.zigbee.dongle.ember.ZigBeeDongleEzsp;
@@ -31,8 +31,44 @@ public class ezspMainSniffer {
     
     private static boolean captureEnable = false;
     private static File file;
-    private static FileOutputStream fos = null;
+    private static DatagramSocket client;
+    private static InetAddress adresse;
+    
+    
+//----------------------
+    
+ // FRAME ==>  ETH II, IP, UDP, ZEP, 802.15.4
 
+    private final static byte INDEXZEP_VERSION                = 2;      // index of the field Version [ZEP]
+    private final static byte INDEXZEP_TYPE                   = 3;      // index of the field Type [ZEP]
+    private final static byte INDEXZEP_CHANNELID              = 4;      // index of the field Channel ID [ZEP]
+    private final static byte INDEXZEP_DEVICEID               = 5;      // index of the field Device ID [ZEP]
+    private final static byte INDEXZEP_CRCLQIMODE             = 7;      // index of the field CRC/LQI Mode [ZEP]
+    private final static byte INDEXZEP_LQIVAL                 = 8;      // index of the field LQI Val [ZEP]
+    private final static byte INDEXZEP_NTPTIMESTAMP           = 9;      // index of the field NTP Timestamp [ZEP]
+    private final static byte INDEXZEP_SEQUENCE               = 17;      // index of the field Sequence [ZEP]
+    private final static byte INDEXZEP_RESERVED               = 21;      // index of the field Reserved [ZEP]
+    private final static byte INDEXZEP_LENGTH                 = 31;      // index of the field Length [ZEP]
+
+    private final static byte ZEP_PACKETSIZE               = 32;      // Total size of UDP and ZEP packets
+
+
+    private final static byte[] ZepEncaps= {
+	    // ============================================================================ ZEP[32] (ZEP version:2 type:1 Data)
+	    0x45, 0x58,                                                 		// [0,1] Preamble "EX"
+	    0x02,                                                       		// [2,2] Version
+	    0x01,                                                       		// [3,3] Type
+	    0x11,                                                       		// [4,4] Channel ID
+	    0x00, 0x01,                                                 		// [5,6] Device ID
+	    0x00,                                                       		// [7,7] CRC/LQI Mode   (LQI = 0x00)
+	    (byte)0xff,                                                       	// [8,8] LQI Val
+	    0x00, 0x0c, (byte)0xd1, 0x36, (byte)0x8b, (byte)0xbd, 0x27, 0x3d,   // [9,16] NTP Timestamp
+	    0x00, 0x05, (byte)0xc6, 0x39,                                     	// [17,20] Sequence
+	    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 		// [21,30] Reserved
+	    0x00,                                                       		// [31,31] Length
+    };
+    
+    
     
     private static EzspFrameHandler ezspListener = new EzspFrameHandler() {
 
@@ -42,41 +78,53 @@ public class ezspMainSniffer {
 				if(response instanceof EzspMfglibRxHandler) {
 					int[] msg = ((EzspMfglibRxHandler)response).getPacketContents();
 					
-					byte[] out = new byte[msg.length];
+					byte[] out = new byte[ZEP_PACKETSIZE + msg.length];
 					
+					for(int loop=0; loop<ZEP_PACKETSIZE; loop++) {
+						out[loop] = ZepEncaps[loop];
+					}	
+					
+					// modify some value inside header
+					
+					// channel
+					out[INDEXZEP_CHANNELID] = 11;
+					
+				    // Device ID
+					out[INDEXZEP_DEVICEID]= 0x00;
+					out[INDEXZEP_DEVICEID+1]= 0x00;					
+
+					// lqi
+					out[INDEXZEP_LQIVAL] = (byte)((EzspMfglibRxHandler)response).getLinkQuality();
+					
+				    // ZEP length
+					out[INDEXZEP_LENGTH]= (byte)(msg.length);
+
+					// Data 802.15.4
 					for(int loop=0; loop<msg.length; loop++) {
-						out[loop] = (byte) msg[loop];
+						out[ZEP_PACKETSIZE+loop] = (byte)msg[loop];
 					}
-										
-					try {
-						// timestamp
-						long stamp = System.currentTimeMillis();
-						fos.write((byte)(stamp&0xff));
-						fos.write((byte)(stamp>>8)&0xff);
-						fos.write((byte)(stamp>>16)&0xff);
-						fos.write((byte)(stamp>>24)&0xff);
-						fos.write((byte)(stamp&0xff));
-						fos.write((byte)(stamp>>8)&0xff);
-						fos.write((byte)(stamp>>16)&0xff);
-						fos.write((byte)(stamp>>24)&0xff);
-						
-						// packet length
-						fos.write((byte)msg.length);
-						fos.write(0);
-						fos.write(0);
-						fos.write(0);
-						fos.write((byte)msg.length);
-						fos.write(0);
-						fos.write(0);
-						fos.write(0);
-						
-						// packet
-						fos.write(out);
-						fos.flush();
-					} catch (IOException e1) {
-						// TODO Auto-generated catch block
-						e1.printStackTrace();
-					}
+					
+					// patch FCS to be compatible with CC24xx
+					out[ZEP_PACKETSIZE+msg.length-1] = (byte)0x80;
+					out[ZEP_PACKETSIZE+msg.length-2] = (byte)0x00;
+					
+					// send to localhost
+		            try {
+		                //On crée notre datagramme
+		                DatagramPacket packet = new DatagramPacket(out, out.length, adresse, 17754);
+		                
+		                //On envoie au serveur
+		                client.send(packet);
+		                logger.debug("Send !!");
+		                
+		             } catch (SocketException e) {
+		                e.printStackTrace();
+		             } catch (UnknownHostException e) {
+		                e.printStackTrace();
+		             } catch (IOException e) {
+		                e.printStackTrace();
+		             }
+					
 				}
 			}
 		}
@@ -87,8 +135,8 @@ public class ezspMainSniffer {
 			
 		}
     	
-    };
-    		
+    };    
+		
 	
     /**
      * The main method.
@@ -124,23 +172,6 @@ public class ezspMainSniffer {
         logger.info("ASH Init");
         if( dongle.initializeEzspProtocol() ) {
         	
-        	/** @todo for testing initialization of zigbee pro stack */
-        	/*
-        	logger.info("Configure stack");
-            dongle.setStackConfigurationValue( EzspConfigId.EZSP_CONFIG_ADDRESS_TABLE_SIZE, 100 );
-            dongle.applyStackConfiguration();
-            
-            logger.info("Configure policy");
-            dongle.setStackPolicyValue( EzspPolicyId.EZSP_POLL_HANDLER_POLICY, EzspDecisionId.EZSP_POLL_HANDLER_IGNORE );
-            dongle.applyStackPolicy();
-            
-            logger.info("Add endpoint");
-            dongle.addEndpoint(1, 0x0007, ZigBeeProfileType.HOME_AUTOMATION.getId(), new int[] { 0 }, new int[] { 0 });
-            
-            logger.info("Start network");
-            dongle.initializeZigbeeNetwork();
-            */
-        	
         	/** @todo for testing initialization of mfgLib */
             
         	// add listener for receive alla ezsp response and handler
@@ -157,61 +188,32 @@ public class ezspMainSniffer {
         		EzspMfglibSetChannelResponse mfgSetChannelRsp = (EzspMfglibSetChannelResponse) dongle.singleCall(mfgSetChannelRqst, EzspMfglibSetChannelResponse.class);
         		
         		if(EmberStatus.EMBER_SUCCESS == mfgSetChannelRsp.getStatus() ) {
-        			// create capture file
-        			String fileName = "zigbee_" + new SimpleDateFormat("yyyy_MM_dd_HH_mm_ss").format(new Date()) + ".cap";
-        			file = new File(fileName);
-        			boolean fvar = false;
+		            try {
+		                // Initialized client part
+		                client = new DatagramSocket(17754);
+		                adresse = InetAddress.getByName("127.0.0.1");    		                
+		                logger.info("Client Udp create !");
+		                
+		             } catch (SocketException e) {
+		                e.printStackTrace();
+		             } catch (IOException e) {
+		                e.printStackTrace();
+		             }
+    				
+    				
+        			// enable capture
+        			captureEnable = true;
         			
-        			try {
-						fvar = file.createNewFile();
-					} catch (IOException e1) {
-						// TODO Auto-generated catch block
-						e1.printStackTrace();
-					}
-        			
-        			if( fvar ) {
-            			// write header file
-        				try {
-							fos = new FileOutputStream(file);
-						} catch (FileNotFoundException e1) {
-							// TODO Auto-generated catch block
-							e1.printStackTrace();
-						}
-        				
-        				byte[] header = {(byte)0xd4, (byte)0xc3, (byte)0xb2, (byte)0xa1, 0x02, 0x00, 0x04, 0x00,
-			                                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-			                                (byte)0xff, (byte)0xff, 0x00, 0x00, (byte)0xc3, 0x00, 0x00, 0x00};
-        				
-        				try {
-							fos.write(header);
-							fos.flush();
-						} catch (IOException e1) {
-							// TODO Auto-generated catch block
-							e1.printStackTrace();
-						}
-        				
-            			
-            			// enable capture
-            			captureEnable = true;
-            			
-                    	// infinite loop ?
-                        logger.info("While loop");
-                    	while(captureEnable) {
-                	        try {
-                				Thread.sleep(500);
-                			} catch (InterruptedException e) {
-                				// TODO Auto-generated catch block
-                				e.printStackTrace();
-                			}
-                    	}
-                    	
-                    	try {
-							fos.close();
-						} catch (IOException e) {
-							// TODO Auto-generated catch block
-							e.printStackTrace();
-						}
-                    }
+                	// infinite loop ?
+                    logger.info("While loop");
+                	while(captureEnable) {
+            	        try {
+            				Thread.sleep(500);
+            			} catch (InterruptedException e) {
+            				// TODO Auto-generated catch block
+            				e.printStackTrace();
+            			}
+                	}
         		}
         	}
         	
